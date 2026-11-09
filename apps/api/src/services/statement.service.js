@@ -1,12 +1,12 @@
 import { z } from 'zod';
-
+ 
 const cursorSchema = z.strictObject({
   position: z.string().regex(/^(0|[1-9]\d*)$/),
   kindOrder: z.union([z.literal(0), z.literal(1)]),
   createdAt: z.string().datetime(),
   id: z.string().uuid(),
 });
-
+ 
 export function decodeStatementCursor(value) {
   if (value === undefined) return null;
   try {
@@ -16,26 +16,28 @@ export function decodeStatementCursor(value) {
     return false;
   }
 }
-
+ 
 function encodeStatementCursor(row) {
   return Buffer.from(JSON.stringify({
     position: row.sortPosition.toString(),
     kindOrder: row.kindOrder,
-    createdAt: row.createdAt.toISOString(),
+    // Microsecond-precision text from PostgreSQL. A JS Date truncates to milliseconds,
+    // which makes the last row of a page reappear at the top of the next page.
+    createdAt: row.cursorCreatedAt,
     id: row.eventId,
   })).toString('base64url');
 }
-
+ 
 function accountReadFilter(auth) {
   if (auth.role === 'ADMIN') return {};
   if (auth.role !== 'ACCOUNT_HOLDER' && auth.role !== 'AUDITOR') return null;
   return { permissions: { some: { userId: auth.userId, canView: true } } };
 }
-
+ 
 export async function getAccountStatement(prismaClient, { accountId, auth, limit, cursor }) {
   const visibility = accountReadFilter(auth);
   if (!visibility) return { notFound: true };
-
+ 
   return prismaClient.$transaction(async (tx) => {
     const account = await tx.account.findFirst({
       where: {
@@ -47,7 +49,7 @@ export async function getAccountStatement(prismaClient, { accountId, auth, limit
       select: { id: true, accountNumber: true, type: true, currencyCode: true },
     });
     if (!account) return { notFound: true };
-
+ 
     const cursorPosition = cursor?.position ?? null;
     const cursorKindOrder = cursor?.kindOrder ?? null;
     const cursorCreatedAt = cursor?.createdAt ?? null;
@@ -127,14 +129,16 @@ export async function getAccountStatement(prismaClient, { accountId, auth, limit
                r."actorRole",r."runningBalancePaise",r."refusalReason"
           FROM refused r
       )
-      SELECT * FROM statement_events e
+      SELECT e.*,
+             to_char(e."createdAt" AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "cursorCreatedAt"
+        FROM statement_events e
        WHERE ${cursorPosition}::bigint IS NULL
           OR (e."sortPosition",e."kindOrder",e."createdAt",e."eventId") >
              (${cursorPosition}::bigint,${cursorKindOrder}::integer,${cursorCreatedAt}::timestamptz,${cursorId}::uuid)
        ORDER BY e."sortPosition",e."kindOrder",e."createdAt",e."eventId"
        LIMIT ${limit + 1}
     `;
-
+ 
     const hasMore = rows.length > limit;
     const pageRows = hasMore ? rows.slice(0, limit) : rows;
     const events = pageRows.map((row) => ({
@@ -148,7 +152,7 @@ export async function getAccountStatement(prismaClient, { accountId, auth, limit
       runningBalancePaise: row.runningBalancePaise.toString(),
       ...(row.refusalReason ? { refusalReason: row.refusalReason } : {}),
     }));
-
+ 
     return {
       account,
       events,
@@ -156,3 +160,4 @@ export async function getAccountStatement(prismaClient, { accountId, auth, limit
     };
   }, { isolationLevel: 'RepeatableRead' });
 }
+ 
